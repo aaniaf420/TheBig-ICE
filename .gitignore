@@ -1,0 +1,42 @@
+# ICE repo: SOURCE ONLY. Runtime state + key material live in /var/lib/ice and
+# must NEVER enter version control. These patterns are defense-in-depth in case a
+# state file is ever copied into the working tree (or a test writes one here).
+
+# ---- SECRETS / runtime state (hard exclude) ----
+*.key
+baseline.key
+baseline.json
+last_scan.json
+events.jsonl
+events.jsonl.*
+*.broken.*
+*.rotated-*
+*.preserved-*
+*.archived
+.enrolled
+ice.lock
+quarantine/
+# any accidental copy of the live store
+var-lib-ice/
+state/
+*.bak
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# ---- editor / OS noise ----
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# ---- test scratch ----
+/tmp/icetest*
+test-out/
