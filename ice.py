@@ -19,15 +19,15 @@ SECURITY MODEL / OPERATING RULES
     while a sensor is blind.
 
 Usage:
-    ice.py baseline        establish known-good snapshot (run when clean)
-    ice.py scan            run one sweep, diff vs baseline, report + alert
-    ice.py scan --respond  ...and engage countermeasures on RED tmpfs procs
-    ice.py watch           loop forever (default 300s interval)
-    ice.py watch --respond loop + active response (only kills with a TTY present)
-    ice.py status          show last scan result and threat level
-    ice.py panel           interactive control panel (dashboard + actions)
-    ice.py rotate-log      archive the audit log + start a fresh chain (recovery)
-
+      (once installed at /usr/local/bin/ice; before install, use `python3 ice.py <cmd>`):
+       sudo ice baseline        establish known-good snapshot (run when clean)
+       sudo ice scan            run one sweep, diff vs baseline, report + alert
+       sudo ice scan --respond  ...and engage countermeasures on RED tmpfs procs
+       sudo ice watch           loop forever (default 120s interval)
+       sudo ice watch --respond loop + active response (only kills with a TTY present)
+       sudo ice status          show last scan result and threat level
+       sudo ice panel           interactive control panel (dashboard + actions)
+       sudo ice rotate-log      archive the audit log + start a fresh chain (recovery)
 Re-run `baseline` after any legitimate change you've reviewed (kernel upgrade,
 opening a new port, adding an SSH key) to clear the drift.
 """
