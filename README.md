@@ -1,16 +1,13 @@
 # ICE — Intrusion Countermeasures Electronics
 
-A single-file, pure-stdlib host intrusion-detection tripwire for Linux. No
-dependencies, no daemon framework — one Python file you drop at
-`/usr/local/bin/ice` and run from a systemd timer.
+A single-file, pure-stdlib host intrusion-detection tripwire for Linux.
 
-What makes it different from a typical tripwire: ICE is **tamper-evident about
-itself**. The baseline snapshot, the operational state, and the audit log are
+ICE is **tamper-evident about itself**. The baseline snapshot, the operational state, and the audit log are
 all HMAC-signed, and the log is hash-chained — so truncating it, reordering it,
 editing a record in place, or deleting one is *detected*, not silently accepted.
 
-> ⚠️ **ICE runs as root and can terminate processes.** Read [Trust model &
-> limits](#trust-model--limits) before deploying. Review the source — it is one
+> ⚠️ **ICE runs as root and can terminate processes.**
+> Read [Trust model & limits](#trust-model--limits) before deploying. Review the source — it is one
 > file, on purpose. No warranty (see LICENSE).
 
 ## What it detects
