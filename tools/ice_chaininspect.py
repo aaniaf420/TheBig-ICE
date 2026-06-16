@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# ice_chaininspect.py -- READ-ONLY. Dump the records straddling the chain break
+#Dump the records straddling the chain break
 # and flag what caused it: duplicate/out-of-order _seq or near-simultaneous
 # timestamps (concurrent-writer RACE) vs a clean missing range (DELETION).
 # Writes nothing.
