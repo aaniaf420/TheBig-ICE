@@ -54,6 +54,13 @@ from collections import namedtuple
 # ----------------------------------------------------------------------------
 # CONFIG  -- tune these to your box
 # ----------------------------------------------------------------------------
+# New install? Review three things, then `sudo ice baseline`:
+#   1. WATCH_FILES / WATCH_DIRS  -- sane cross-distro defaults below; add the
+#      configs that matter on your system, drop any you don't have (missing
+#      paths are handled gracefully, not errors).
+#   2. SUSPICIOUS_EXEC_DIRS / thresholds -- usually fine as-is.
+#   3. BENIGN_LISTENERS -- ships EMPTY (see below). Only populate it after you
+#      see a trusted app re-flagged as a new listener on every reboot.
 HOME = Path.home()
 
 WATCH_FILES = [
@@ -76,20 +83,37 @@ FAILED_AUTH_THRESHOLD = 5
 
 # Known-benign listeners that legitimately rebind to a fresh port on every
 # restart -- so they re-fire as "new listening socket" forever, no matter how
-# recently you baselined. A match DOWNGRADES the new-listener detection from
-# WARN to INFO; it does NOT suppress it. Matching is STRICT: the listener's
-# comm must EXACTLY equal `comm` (not a substring -- so "kdeconnectd-evil" or
+# recently you baselined (think KDE Connect, browsers doing mDNS/QUIC, some
+# media/cast daemons). A match DOWNGRADES the new-listener detection from WARN
+# to INFO; it does NOT suppress it. Matching is STRICT: the listener's comm must
+# EXACTLY equal `comm` (not a substring -- so "kdeconnectd-evil" or
 # "xkdeconnectd" do NOT match) AND the resolved exe path must EXACTLY equal
 # `exe`. comm is attacker-spoofable via prctl, so the exe-path equality is the
-# real anchor: an attacker would have to also be running from the genuine
-# system path, at which point that path's own binary is what's executing.
-# proto/addr/port constraints still apply on top.
-BENIGN_LISTENERS = [
-    {"comm": "kdeconnectd", "exe": "/usr/bin/kdeconnectd", "proto": "udp",
-     "addrs": {"*", "0.0.0.0", "[::]"}, "port_min": 1024, "port_max": 65535},
-    {"comm": "brave", "exe": "/opt/brave-bin/brave", "proto": "udp",
-     "addrs": {"224.0.0.251"}, "port_min": 5353, "port_max": 5353},
-]
+# real anchor: an attacker would have to also be running from the genuine system
+# path, at which point that path's own binary is what's executing. proto/addr/
+# port constraints still apply on top.
+#
+# >>> SHIPS EMPTY ON PURPOSE. <<< Leave it empty and every new listener simply
+# WARNs -- which is the safe default. Only add a rule once a scan repeatedly
+# WARNs about an app YOU TRUST that genuinely roams ports across reboots (a
+# one-time port that stays put is already covered by `baseline`, so it needs no
+# rule). To build a rule for such a listener, with its PID from the scan:
+#     comm        -> ps -o comm= -p <pid>
+#     exe         -> readlink -f /proc/<pid>/exe        # the anchor; exact match
+#     proto       -> "tcp" or "udp"
+#     addrs       -> the bind address shown in the detection:
+#                    "*" / "0.0.0.0" / "[::]" for wildcard, or a specific addr
+#                    (e.g. mDNS multicast "224.0.0.251")
+#     port_min/max-> the range it roams over (use the same value twice if fixed)
+#
+# Example (COMMENTED OUT -- copy, verify the exe path on YOUR system, uncomment):
+#   BENIGN_LISTENERS = [
+#       {"comm": "kdeconnectd", "exe": "/usr/bin/kdeconnectd", "proto": "udp",
+#        "addrs": {"*", "0.0.0.0", "[::]"}, "port_min": 1024, "port_max": 65535},
+#       {"comm": "avahi-daemon", "exe": "/usr/sbin/avahi-daemon", "proto": "udp",
+#        "addrs": {"224.0.0.251"}, "port_min": 5353, "port_max": 5353},
+#   ]
+BENIGN_LISTENERS = []
 WATCH_INTERVAL = 120
 
 # --- active response (only engages with `scan --respond` / `watch --respond`) --
