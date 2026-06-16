@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-# ice_chaincheck.py -- READ-ONLY. Find where the audit-log HMAC chain first
+#Find where the audit-log HMAC chain first
 # breaks and classify it. Imports the live ice binary so it uses the exact same
 # key resolution + record canonicalization as the writer. Writes nothing.
 #
 #   sudo python3 ice_chaincheck.py
-#   sudo ICE_KEY=/path/to/offhost.key python3 ice_chaincheck.py   # test a key
+#   sudo ICE_KEY=/path/to/offhost.key python3 ice_chaincheck.py   
 #
 import os, sys, json, hmac, hashlib, importlib.util, importlib.machinery
 
