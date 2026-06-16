@@ -115,5 +115,35 @@ with tempfile.TemporaryDirectory() as td:
         sys.stdin = old_stdin
     ck("no TTY + no --yes -> refuses", code not in (0, None), f"code={code}")
 
+print("== auto-rotate on baseline when chain broken (merge behavior) ==")
+with tempfile.TemporaryDirectory() as td:
+    seed(td, scans=5); break_chain(td); broken = ice.EVENTS_LOG.read_text()
+    quiet(ice.do_baseline)                                  # should auto-rotate
+    arch = [p for p in os.listdir(td) if p.startswith("events.jsonl.rotated-")]
+    ck("baseline auto-archived the broken log", len(arch) == 1, str(arch))
+    ck("archive preserved 0400 + bytes intact", arch and (os.stat(os.path.join(td, arch[0])).st_mode & 0o777) == 0o400 and open(os.path.join(td, arch[0])).read() == broken)
+    new = [json.loads(l) for l in ice.EVENTS_LOG.read_text().splitlines()]
+    ck("in-band rotation record at seq 1 (finding #1)", new and new[0].get("_seq") == 1 and new[0].get("action") == "rotate-log", str(new[0] if new else None))
+    st2, s2 = ice._verify_blob(ice.read_json_nofollow(ice.LAST_SCAN_FILE))
+    ck("fresh chain verifies after baseline-rotate", s2 == "ok" and not any(d.severity == "CRIT" for d in ice.verify_event_chain(int(st2["log_seq"]), st2["log_head"])))
+
+print("== baseline on INTACT chain does NOT rotate ==")
+with tempfile.TemporaryDirectory() as td:
+    seed(td, scans=3); quiet(ice.do_baseline)
+    ck("no spurious archive on intact chain", not any(p.startswith("events.jsonl.rotated-") for p in os.listdir(td)))
+
+print("== finding #2: symlinked broken log halts baseline (die) ==")
+with tempfile.TemporaryDirectory() as td:
+    seed(td, scans=3)
+    L = ice.EVENTS_LOG.read_text().splitlines()
+    decoy = os.path.join(td, "decoy.jsonl"); open(decoy, "w").write("\n".join(l for l in L if json.loads(l).get("_seq") != 2) + "\n")
+    os.remove(ice.EVENTS_LOG); os.symlink(decoy, ice.EVENTS_LOG)
+    code = None
+    try:
+        quiet(ice.do_baseline)
+    except SystemExit as e:
+        code = e.code
+    ck("symlinked log halts baseline", code not in (0, None), f"code={code}")
+
 print(f"\n==== {len(P)} passed, {len(F)} failed ====")
 sys.exit(1 if F else 0)

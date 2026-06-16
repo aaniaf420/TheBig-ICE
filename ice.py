@@ -1181,9 +1181,23 @@ def do_baseline():
     # Re-anchor operational state to the current end of the audit log so the
     # signed chain continues seamlessly (no truncation false-positive on the
     # next scan). Baseline means "I assert the system is clean now", so the
-    # current log tail is trusted as the new anchor.
-    seq, head = _read_chain_tail()
-    _LOG_CHAIN["seq"], _LOG_CHAIN["head"] = seq, head
+    # current log tail is trusted as the new anchor -- UNLESS that chain is
+    # already broken/truncated. Continuing a broken chain would re-fire CRIT on
+    # every future scan no matter how often you re-baseline, so detect it and
+    # rotate: archive the suspect log read-only and start a fresh chain whose
+    # first record documents the reset. Same core as `ice rotate-log`, minus the
+    # interactive confirm -- running baseline is already an explicit "assert
+    # clean" act; we make the rotation LOUD + logged so it is never a surprise.
+    if _chain_is_broken():
+        archive = _archive_and_reset_chain("auto-rotate on baseline (prior chain broken)")
+        if archive:
+            print(f"  {C['YELLOW']}{C['BOLD']}[rotated]{C['RST']} prior audit-log chain was "
+                  f"broken/truncated -- archived to {C['BOLD']}{archive.name}{C['RST']} "
+                  f"(read-only) for review; started a fresh chain.")
+        seq, head = _LOG_CHAIN["seq"], _LOG_CHAIN["head"]
+    else:
+        seq, head = _read_chain_tail()
+        _LOG_CHAIN["seq"], _LOG_CHAIN["head"] = seq, head
     save_json_secure(LAST_SCAN_FILE, _sign_blob(
         {"ts": now_iso(), "threat": "GREEN", "count": 0,
          "log_seq": seq, "log_head": head}))
@@ -1533,42 +1547,84 @@ def do_panel():
     ensure_state_dir()
     curses.wrapper(_panel_loop)
 
-def do_rotate_log(args):
-    # RECOVERY: archive the current audit log read-only, reset the HMAC chain, and
-    # seed a fresh chain whose FIRST record documents the rotation (archive path,
-    # prior signed anchor, record count, reason). NEVER deletes the old log -- it
-    # is renamed aside and chmod'd 0400, so it stays an auditable artifact. Writer
-    # command: main() holds the single-writer lock for it and refuses under
-    # contention (LOUD_ON_LOCK). Run ONLY after confirming a break is benign --
-    # this deliberately moves the chain PAST the break, which would equally bury
-    # real tamper. Requires explicit confirmation (interactive "ROTATE", or --yes).
-    ensure_state_dir()
-    yes = "--yes" in args or "-y" in args
+def _chain_is_broken():
+    # True if the on-disk audit chain fails to verify against its signed anchor.
+    # do_baseline uses this to decide whether re-baselining must rotate: continuing
+    # a broken chain would re-fire CRIT on every future scan no matter how often you
+    # re-baseline (the wedge that motivated all of this). Wraps the die()-prone key
+    # path -- if the key itself can't be validated we return False and let the
+    # caller proceed/fail through its normal path rather than auto-rotating blind.
+    try:
+        state, st = _verify_blob(read_json_nofollow(LAST_SCAN_FILE))
+        if st == "tampered":
+            return True
+        aseq = int(state.get("log_seq", 0) or 0) if (st == "ok" and state) else 0
+        ahead = (state.get("log_head", "") or "") if (st == "ok" and state) else ""
+        dets = check_log_integrity() + verify_event_chain(aseq, ahead)
+        return any(d.severity == "CRIT" for d in dets)
+    except SystemExit:
+        return False
 
-    # Capture the prior SIGNED anchor for provenance (before we touch anything).
+def _archive_and_reset_chain(reason):
+    # Shared rotation CORE for both entry points: `ice rotate-log` (explicit,
+    # confirmed) and do_baseline (automatic, when the chain is already broken).
+    # Archives the current audit log READ-ONLY -- renamed aside + chmod 0400, NEVER
+    # deleted, so it stays an auditable artifact -- then resets the in-memory chain
+    # and writes an IN-BAND rotation record as seq 1 (archive path, prior signed
+    # anchor, record count, reason) so the reset is logged, not a silent gap.
+    # Refuses (die) on a symlink/non-regular log: that is tamper, not our log.
+    # Caller MUST hold the writer lock and re-anchors signed state afterward.
+    # Returns the archive Path, or None if there was no log to rotate.
     prev_state, pst = _verify_blob(read_json_nofollow(LAST_SCAN_FILE))
     prev_seq = int(prev_state.get("log_seq", 0) or 0) if (pst == "ok" and prev_state) else 0
     prev_head = (prev_state.get("log_head", "") or "") if (pst == "ok" and prev_state) else ""
-
-    # Inspect the current log. A symlink/non-regular log here is tamper -- refuse
-    # (don't rename-archive a redirected path as if it were our log).
+    archive = None
     try:
         lst = os.lstat(EVENTS_LOG)
         if statmod.S_ISLNK(lst.st_mode) or not statmod.S_ISREG(lst.st_mode):
             die(f"audit log {EVENTS_LOG} is not a regular file -- refusing to rotate (tamper)")
         n_records = sum(1 for _ in _iter_log_records())
-        have_log = True
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        archive = STATE_DIR / f"events.jsonl.rotated-{stamp}"
+        if archive.exists():
+            archive = STATE_DIR / f"events.jsonl.rotated-{stamp}-{os.getpid()}"
+        os.rename(EVENTS_LOG, archive)   # atomic within the state dir, non-destructive
+        try:
+            os.chmod(archive, 0o400)
+        except OSError:
+            pass
     except FileNotFoundError:
-        n_records, have_log = 0, False
+        n_records = 0
+    _LOG_CHAIN["seq"], _LOG_CHAIN["head"] = 0, ""
+    log_action("rotate-log", {
+        "archived_to": str(archive) if archive else None,
+        "archived_records": n_records,
+        "previous_anchor_seq": prev_seq,
+        "previous_anchor_head": prev_head[:16],
+        "host": socket.gethostname(),
+        "reason": reason,
+    }, "chain-reset")
+    return archive
 
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    archive = STATE_DIR / f"events.jsonl.rotated-{stamp}"
-    if archive.exists():
-        archive = STATE_DIR / f"events.jsonl.rotated-{stamp}-{os.getpid()}"
+def do_rotate_log(args):
+    # EXPLICIT rotation: archive a (reviewed, benign) broken chain and start fresh
+    # WITHOUT re-snapshotting the baseline. do_baseline rotates automatically when
+    # it finds a broken chain; use THIS when you want to rotate but keep the current
+    # file/listener baseline as your reference. Writer command (main holds the lock;
+    # refuses under contention, LOUD_ON_LOCK). Requires confirmation -- this moves
+    # the chain PAST a break, which would equally bury real tamper, so be sure it's
+    # benign (tools/ice_chaincheck.py, tools/ice_chaininspect.py) first.
+    ensure_state_dir()
+    yes = "--yes" in args or "-y" in args
+    prev_state, pst = _verify_blob(read_json_nofollow(LAST_SCAN_FILE))
+    prev_seq = int(prev_state.get("log_seq", 0) or 0) if (pst == "ok" and prev_state) else 0
+    try:
+        n_records = sum(1 for _ in _iter_log_records())
+    except FileNotFoundError:
+        n_records = 0
 
     print(f"{C['YELLOW']}{C['BOLD']}rotate-log{C['RST']} -- reset the audit-log HMAC chain")
     print(f"  current log : {EVENTS_LOG}  ({n_records} record/s)")
-    print(f"  archive to  : {archive}")
     print(f"  prior anchor: seq {prev_seq}")
     print(f"  {C['DIM']}the old log is PRESERVED read-only (renamed, never deleted). a fresh chain")
     print(f"  starts at seq 1; its first record records this rotation.{C['RST']}")
@@ -1583,27 +1639,8 @@ def do_rotate_log(args):
             print(f"{C['GREEN']}aborted -- nothing changed.{C['RST']}")
             return
 
-    # Archive: rename is atomic within the state dir and non-destructive.
-    if have_log:
-        os.rename(EVENTS_LOG, archive)
-        try:
-            os.chmod(archive, 0o400)
-        except OSError:
-            pass
-
-    # Fresh chain: reset in-memory state, then write the rotation record as seq 1.
-    _LOG_CHAIN["seq"], _LOG_CHAIN["head"] = 0, ""
-    ts = now_iso()
-    log_action("rotate-log", {
-        "archived_to": str(archive) if have_log else None,
-        "archived_records": n_records,
-        "previous_anchor_seq": prev_seq,
-        "previous_anchor_head": prev_head[:16],
-        "host": socket.gethostname(),
-        "reason": "operator chain rotation after reviewing a benign break",
-    }, "chain-reset")
-    # Re-anchor the signed operational state to the fresh chain (GREEN, like baseline).
-    _persist_anchor(ts, "GREEN", 0)
+    archive = _archive_and_reset_chain("explicit operator rotate-log after reviewing a benign break")
+    _persist_anchor(now_iso(), "GREEN", 0)
 
     # Prove it: verify the fresh chain end-to-end against the new anchor.
     dets = check_log_integrity() + verify_event_chain(_LOG_CHAIN["seq"], _LOG_CHAIN["head"])
@@ -1612,8 +1649,8 @@ def do_rotate_log(args):
 
     print(f"{C['GREEN']}{C['BOLD']}chain rotated.{C['RST']} fresh chain at seq {_LOG_CHAIN['seq']} "
           f"(head {_LOG_CHAIN['head'][:12]}...), verified clean.")
-    if have_log:
-        print(f"{C['DIM']}old log preserved at {archive} -- inspect with ice_chaincheck if needed.{C['RST']}")
+    if archive:
+        print(f"{C['DIM']}old log preserved at {archive} -- inspect with tools/ice_chaincheck.py if needed.{C['RST']}")
     print(f"run {C['CYAN']}sudo ice scan{C['RST']} for a fresh reading (or wait for the timer).")
 
 def main():
