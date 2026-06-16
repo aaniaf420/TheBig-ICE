@@ -114,6 +114,18 @@ FAILED_AUTH_THRESHOLD = 5
 #        "addrs": {"224.0.0.251"}, "port_min": 5353, "port_max": 5353},
 #   ]
 BENIGN_LISTENERS = []
+# Optional EXTERNAL allowlist (same schema as the example above), so a deployment
+# can add its own trusted port-roaming apps WITHOUT editing this file -- the
+# shipped binary stays a clean slate. Loaded at scan time IF the file exists AND
+# is trusted: a regular file (not a symlink), owned by root or the running euid,
+# and NOT group/world-writable. Because this list only DOWNGRADES new-listener
+# WARNs to INFO, an untrusted file would be an alert-SUPPRESSION vector -- so an
+# untrusted or malformed file is IGNORED with a warning (fail toward MORE
+# alerting, never silently suppress). Never fatal. Create it as root:
+#     sudo install -d -m 0755 /etc/ice
+#     sudo install -m 0644 examples/listeners.example.json /etc/ice/listeners.json
+# Override the path with the ICE_LISTENERS env var.
+LISTENERS_FILE = Path(os.environ.get("ICE_LISTENERS", "/etc/ice/listeners.json"))
 WATCH_INTERVAL = 120
 
 # --- active response (only engages with `scan --respond` / `watch --respond`) --
@@ -700,6 +712,61 @@ def snapshot():
                        f"cannot read {akf} at current privilege"))
     return snap, cov
 
+def _load_external_listeners(path):
+    # Load extra BENIGN_LISTENERS rules from an external JSON file (see
+    # LISTENERS_FILE). This allowlist only DOWNGRADES new-listener WARNs to INFO,
+    # so an untrusted file is an alert-SUPPRESSION vector: we refuse to honor a
+    # symlinked, non-root-owned, or group/world-writable file (and a malformed
+    # one) and fall back to [] -- failing toward MORE alerting. Never fatal.
+    try:
+        st = os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return []                       # no config -> clean slate (normal)
+    except OSError:
+        return []
+    if statmod.S_ISLNK(st.st_mode) or not statmod.S_ISREG(st.st_mode):
+        sys.stderr.write(f"[ice] ignoring {path}: not a regular file (symlink/tamper).\n")
+        return []
+    if st.st_uid not in (0, os.geteuid()):
+        sys.stderr.write(f"[ice] ignoring {path}: not owned by root/euid -- untrusted.\n")
+        return []
+    if st.st_mode & 0o022:
+        sys.stderr.write(f"[ice] ignoring {path}: group/world-writable -- untrusted (chmod 0644).\n")
+        return []
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            raw = json.loads(os.read(fd, 1 << 20).decode("utf-8", "replace"))
+        finally:
+            os.close(fd)
+    except (OSError, ValueError) as e:
+        sys.stderr.write(f"[ice] ignoring {path}: unreadable/invalid JSON ({e}).\n")
+        return []
+    if not isinstance(raw, list):
+        sys.stderr.write(f"[ice] ignoring {path}: top level must be a JSON array.\n")
+        return []
+    rules = []
+    for i, item in enumerate(raw):
+        try:
+            rules.append({
+                "comm": str(item["comm"]), "exe": str(item["exe"]),
+                "proto": str(item["proto"]), "addrs": set(item["addrs"]),
+                "port_min": int(item["port_min"]), "port_max": int(item["port_max"]),
+            })
+        except (KeyError, TypeError, ValueError):
+            sys.stderr.write(f"[ice] {path}: skipping malformed rule #{i}.\n")
+    return rules
+
+_BENIGN_CACHE = None
+def _benign_listeners():
+    # in-code defaults (ship empty) + validated external rules; loaded once per
+    # process. The systemd timer spawns a fresh process per scan, so an edited
+    # /etc/ice/listeners.json takes effect on the next scan with no restart.
+    global _BENIGN_CACHE
+    if _BENIGN_CACHE is None:
+        _BENIGN_CACHE = list(BENIGN_LISTENERS) + _load_external_listeners(LISTENERS_FILE)
+    return _BENIGN_CACHE
+
 def _listener_is_benign(key, descr):
     # key is "proto:addr:port"; descr is the "comm exe" annotation. Returns True
     # only on an EXACT comm + EXACT exe-path match plus proto/addr/port limits.
@@ -719,7 +786,7 @@ def _listener_is_benign(key, descr):
     comm_tok, exe_tok = toks[0], toks[-1]
     if not exe_tok.startswith("/"):
         return False          # exe must be an absolute path
-    for rule in BENIGN_LISTENERS:
+    for rule in _benign_listeners():
         if (comm_tok == rule["comm"]
                 and exe_tok == rule["exe"]
                 and rule["proto"] == proto

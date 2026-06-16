@@ -1,0 +1,18 @@
+[
+  {
+    "comm": "kdeconnectd",
+    "exe": "/usr/bin/kdeconnectd",
+    "proto": "udp",
+    "addrs": ["*", "0.0.0.0", "[::]"],
+    "port_min": 1024,
+    "port_max": 65535
+  },
+  {
+    "comm": "avahi-daemon",
+    "exe": "/usr/sbin/avahi-daemon",
+    "proto": "udp",
+    "addrs": ["224.0.0.251"],
+    "port_min": 5353,
+    "port_max": 5353
+  }
+]

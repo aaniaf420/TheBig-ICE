@@ -145,5 +145,23 @@ with tempfile.TemporaryDirectory() as td:
         code = e.code
     ck("symlinked log halts baseline", code not in (0, None), f"code={code}")
 
+print("== external listeners config: trust validation ==")
+import json as _json
+VALID = [{"comm": "kdeconnectd", "exe": "/usr/bin/kdeconnectd", "proto": "udp",
+          "addrs": ["*", "0.0.0.0"], "port_min": 1024, "port_max": 65535}]
+with tempfile.TemporaryDirectory() as td:
+    p = os.path.join(td, "listeners.json")
+    ck("absent config -> clean slate []", ice._load_external_listeners(p) == [])
+    open(p, "w").write(_json.dumps(VALID)); os.chmod(p, 0o644)
+    r = ice._load_external_listeners(p)
+    ck("trusted config -> rule loaded, addrs is set", len(r) == 1 and isinstance(r[0]["addrs"], set))
+    os.chmod(p, 0o666)
+    ck("world-writable config -> ignored (suppression vector)", ice._load_external_listeners(p) == [])
+    os.chmod(p, 0o644)
+    sl = os.path.join(td, "sl.json"); os.symlink(p, sl)
+    ck("symlinked config -> ignored", ice._load_external_listeners(sl) == [])
+    bad = os.path.join(td, "bad.json"); open(bad, "w").write("{not json"); os.chmod(bad, 0o644)
+    ck("malformed config -> ignored", ice._load_external_listeners(bad) == [])
+
 print(f"\n==== {len(P)} passed, {len(F)} failed ====")
 sys.exit(1 if F else 0)

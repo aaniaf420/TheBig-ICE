@@ -15,6 +15,9 @@ events.jsonl.*
 *.archived
 .enrolled
 ice.lock
+# external runtime config: the example (listeners.example.json) is tracked;
+# a real /etc/ice/listeners.json copied into the tree must not be committed
+listeners.json
 quarantine/
 # any accidental copy of the live store
 var-lib-ice/
