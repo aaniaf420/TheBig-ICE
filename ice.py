@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ICE - Intrusion Countermeasures Electronics
-Host-based intrusion detection for a single Linux box (Arch/Kali).
+Host-based intrusion detection for a single Linux box.
 
 Defensive monitoring only. It detects, logs, and alerts. With --respond it
 will terminate confirmed-hostile tmpfs processes, but it does not attack back.
