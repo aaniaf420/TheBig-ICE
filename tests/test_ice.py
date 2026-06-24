@@ -163,5 +163,60 @@ with tempfile.TemporaryDirectory() as td:
     bad = os.path.join(td, "bad.json"); open(bad, "w").write("{not json"); os.chmod(bad, 0o644)
     ck("malformed config -> ignored", ice._load_external_listeners(bad) == [])
 
+print("== audit-log durability: fsync on append ==")
+import os as _os
+with tempfile.TemporaryDirectory() as td:
+    seed(td, scans=2)                       # real key + a live chain to extend
+    real_fsync = _os.fsync
+    seen = []
+    ice.os.fsync = lambda fd: (seen.append(fd), real_fsync(fd))[1]
+    try:
+        before_seq = ice._LOG_CHAIN["seq"]
+        with contextlib.redirect_stderr(io.StringIO()):
+            ice.append_event({"ts": "x", "probe": "fsync-call"})
+    finally:
+        ice.os.fsync = real_fsync
+    ck("append_event fsyncs the log fd", len(seen) >= 1, f"fsync calls={len(seen)}")
+    ck("append advanced chain after fsync", ice._LOG_CHAIN["seq"] == before_seq + 1)
+
+print("== audit-log durability: failed fsync still advances chain ==")
+with tempfile.TemporaryDirectory() as td:
+    seed(td, scans=2)
+    real_fsync = _os.fsync
+    def boom(fd): raise OSError(5, "EIO simulated")
+    ice.os.fsync = boom
+    err = io.StringIO()
+    try:
+        before_seq, before_head = ice._LOG_CHAIN["seq"], ice._LOG_CHAIN["head"]
+        with contextlib.redirect_stderr(err):
+            ice.append_event({"ts": "y", "probe": "fsync-fail"})
+        adv_seq, adv_head = ice._LOG_CHAIN["seq"], ice._LOG_CHAIN["head"]
+    finally:
+        ice.os.fsync = real_fsync
+    ck("failed fsync still advances seq", adv_seq == before_seq + 1, f"{before_seq}->{adv_seq}")
+    ck("failed fsync still advances head", adv_head != before_head and adv_head)
+    ck("failed fsync warns to stderr", "fsync" in err.getvalue().lower(), repr(err.getvalue()))
+    # The fsync-fail record is really on disk and chained; a later normal append
+    # must extend it cleanly -- proves the fail path left no corruption.
+    with contextlib.redirect_stderr(io.StringIO()):
+        ice.append_event({"ts": "z", "probe": "after-fail"})
+    ck("subsequent append verifies clean (no corruption)",
+       not any(d.severity == "CRIT" for d in ice.verify_event_chain(0, "")))
+
+print("== anchor durability: save_json_secure round-trips + verifies ==")
+with tempfile.TemporaryDirectory() as td:
+    repoint(ice, td); quiet(ice.do_baseline)
+    real_fsync = _os.fsync
+    seen = []
+    ice.os.fsync = lambda fd: (seen.append(fd), real_fsync(fd))[1]
+    try:
+        ice.save_json_secure(ice.LAST_SCAN_FILE, ice._sign_blob(
+            {"ts": "t", "threat": "GREEN", "count": 0, "log_seq": 0, "log_head": ""}))
+    finally:
+        ice.os.fsync = real_fsync
+    ck("save_json_secure fsyncs the tmp fd", len(seen) >= 1, f"fsync calls={len(seen)}")
+    st, status = ice._verify_blob(ice.read_json_nofollow(ice.LAST_SCAN_FILE))
+    ck("anchor round-trips and verifies signed", status == "ok" and st.get("threat") == "GREEN", str(status))
+
 print(f"\n==== {len(P)} passed, {len(F)} failed ====")
 sys.exit(1 if F else 0)

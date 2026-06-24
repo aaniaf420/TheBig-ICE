@@ -334,6 +334,25 @@ def append_event(obj):
     try:
         with _open_nofollow_append(EVENTS_LOG) as f:
             f.write(json.dumps(rec) + "\n")
+            # Durability: write()/the with-block's close only guarantee the record
+            # reaches the page cache, not the platter. flush()+fsync() force it to
+            # disk BEFORE we advance the in-memory chain and before append_event
+            # returns. Without this, an unclean shutdown (crash/power-cut) can lose
+            # the tail record -> torn chain -> a benign "truncated" CRIT on next
+            # boot, which trains the operator to reflexively rotate -- exactly the
+            # wrong muscle memory on a tamper-evident log.
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError as e:
+                # The record IS already in the file (write() succeeded); fsync only
+                # governs whether it SURVIVES a crash. A failed fsync is therefore a
+                # durability WARNING, never a write failure -- the chain MUST still
+                # advance to match the on-disk content, or the next append computes
+                # the wrong seq/head and breaks the chain itself. Its own try/except
+                # keeps that failure from being mistaken for a write failure below.
+                sys.stderr.write(f"[ice] WARNING: fsync of {EVENTS_LOG} failed ({e}) "
+                                 f"-- record written but may not survive a crash\n")
         _LOG_CHAIN["seq"] = seq
         if mac is not None:
             _LOG_CHAIN["head"] = mac
@@ -348,6 +367,19 @@ def save_json_secure(path, data):
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "w") as f:
             f.write(json.dumps(data, indent=2, sort_keys=True))
+            # Crash-consistency for the SIGNED anchor (last_scan.json carries
+            # log_seq/log_head, which DEFINE where the log is allowed to end).
+            # os.replace is atomic, but without flushing the tmp file's contents to
+            # disk first a crash can leave the anchor pointing past a log tail that
+            # IS now durable (append_event fsyncs) -- the two would disagree. fsync
+            # the data before the rename so the durable ordering holds: log record
+            # on disk (append) THEN anchor on disk (here), matching do_scan's order.
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError as e:
+                sys.stderr.write(f"[ice] WARNING: fsync of {tmp} failed ({e}) "
+                                 f"-- anchor written but may not survive a crash\n")
         os.replace(tmp, path)
     finally:
         if tmp.exists():

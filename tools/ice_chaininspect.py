@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-#Dump the records straddling the chain break
-# and flag what caused it: duplicate/out-of-order _seq or near-simultaneous
-# timestamps (concurrent-writer RACE) vs a clean missing range (DELETION).
-# Writes nothing.
-#
-#   sudo python3 ice_chaininspect.py            # auto-locate the break
-#   sudo python3 ice_chaininspect.py 544        # window around a given _seq
-#
 import os, sys, json, hmac, hashlib, importlib.util, importlib.machinery
 from datetime import datetime
 
@@ -17,25 +9,31 @@ def load_ice(path="/usr/local/bin/ice"):
     return mod
 
 def collect(ice):
-    out = []
-    for rec in ice._iter_log_records():
-        if isinstance(rec, dict):
-            out.append(rec)
-    return out
+    return [rec for rec in ice._iter_log_records() if isinstance(rec, dict)]
 
-def locate_break(ice, recs):
+def load_anchor(ice):
+    try:
+        state, status = ice._verify_blob(ice.read_json_nofollow(ice.LAST_SCAN_FILE))
+    except Exception:
+        return None, None
+    if status != "ok":
+        return None, None
+    return int(state.get("log_seq", 0) or 0), state.get("log_head", "") or ""
+
+def replay(ice, recs):
     key = ice._baseline_key(create=False)
-    prev = ""
-    idx = 0
+    prev, expected, last_seq, break_idx = "", None, 0, None
     for i, rec in enumerate(recs):
-        if not ("_seq" in rec and "_mac" in rec):
+        if not (isinstance(rec, dict) and "_seq" in rec and "_mac" in rec):
             continue
         r = dict(rec); mac = r.pop("_mac")
         want = hmac.new(key, (prev + json.dumps(r, sort_keys=True)).encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(want, str(rec["_mac"])):
-            return i
-        prev = rec["_mac"]
-    return None
+            break_idx = i; break
+        if expected is not None and rec["_seq"] != expected:
+            break_idx = i; break
+        prev = rec["_mac"]; last_seq = rec["_seq"]; expected = rec["_seq"] + 1
+    return break_idx, last_seq, prev
 
 def brief(rec):
     if "action" in rec:
@@ -43,56 +41,35 @@ def brief(rec):
     d = rec.get("detections", []) or []
     return f"{rec.get('threat','?')} {len(d)}det"
 
-def main():
-    ice = load_ice(os.environ.get("ICE_SRC", "/usr/local/bin/ice"))
-    recs = collect(ice)
-    if len(sys.argv) > 1:
-        center_seq = int(sys.argv[1])
-        bi = next((i for i, r in enumerate(recs) if r.get("_seq") == center_seq), len(recs)//2)
-    else:
-        bi = locate_break(ice, recs)
-        if bi is None:
-            print("no break found -- chain verifies."); return
+def window(recs, bi):
     lo, hi = max(0, bi - 6), min(len(recs), bi + 6)
-    print(f"break at file-record #{bi} (_seq={recs[bi].get('_seq')}). showing #{lo}..#{hi-1}:\n")
-    print(f"  {'#':>4} {'_seq':>6} {'mac':>3}  {'ts':<27} brief")
-    prev_seq = prev_dt = None
-    seqs = []
+    print(f"showing file-records #{lo}..#{hi-1} (anomaly at #{bi}, _seq={recs[bi].get('_seq')}):\n")
+    prev_seq = prev_dt = None; seqs = []; race_signal = False
     for i in range(lo, hi):
-        r = recs[i]
-        seq = r.get("_seq", "-"); mac = "Y" if "_mac" in r else "n"
-        ts = str(r.get("ts", "?")); seqs.append(seq if isinstance(seq, int) else None)
-        flag = " <-- BREAK" if i == bi else ""
+        r = recs[i]; seq = r.get("_seq", "-"); ts = str(r.get("ts", "?"))
+        seqs.append(seq if isinstance(seq, int) else None); flag = " <-- ANOMALY" if i == bi else ""
         try:
             dt = datetime.fromisoformat(ts)
-            if prev_dt is not None and dt < prev_dt:
-                flag += "  [ts goes BACKWARD]"
-            if prev_dt is not None and abs((dt - prev_dt).total_seconds()) <= 2 and i != bi:
-                flag += "  [<=2s from prev: possible race]"
+            if prev_dt is not None and dt < prev_dt: flag += "  [ts BACKWARD]"; race_signal = True
+            if prev_dt is not None and abs((dt - prev_dt).total_seconds()) <= 2 and i != bi: flag += "  [<=2s]"
             prev_dt = dt
-        except Exception:
-            pass
+        except Exception: pass
         if isinstance(seq, int) and isinstance(prev_seq, int):
-            if seq == prev_seq:
-                flag += "  [DUP seq]"
-            elif seq < prev_seq:
-                flag += "  [seq DECREASES]"
-            elif seq > prev_seq + 1:
-                flag += f"  [GAP: {seq - prev_seq - 1} missing]"
+            if seq == prev_seq: flag += "  [DUP seq]"; race_signal = True
+            elif seq < prev_seq: flag += "  [seq DECREASES]"; race_signal = True
+            elif seq > prev_seq + 1: flag += f"  [GAP: {seq - prev_seq - 1} missing]"
         prev_seq = seq if isinstance(seq, int) else prev_seq
-        print(f"  {i:>4} {str(seq):>6} {mac:>3}  {ts:<27} {brief(r)}{flag}")
+    return seqs, race_signal
 
-    ints = [s for s in seqs if isinstance(s, int)]
-    print("\nverdict:")
-    if len(set(ints)) != len(ints):
-        print("  DUPLICATE seq numbers in window -> concurrent-writer RACE (two ICE procs")
-        print("  wrote before the single-writer lock existed). Benign; the lock prevents recurrence.")
-    elif ints == sorted(ints) and (ints[-1] - ints[0]) > len(ints) - 1:
-        print("  clean monotonic seq with a GAP (missing numbers), neighbors intact -> records")
-        print("  were DELETED/truncated from the middle. No benign cause -- investigate that ts.")
-    else:
-        print("  mixed signal -- eyeball the rows above (look for backward ts / dup seq = race;")
-        print("  a clean hole with normal neighbors = deletion).")
-
-if __name__ == "__main__":
-    main()
+def run_auto(ice):
+    recs = collect(ice); anchor_seq, anchor_head = load_anchor(ice)
+    break_idx, last_seq, last_head = replay(ice, recs)
+    if break_idx is not None:
+        seqs, race_signal = window(recs, break_idx)
+        ints = [s for s in seqs if isinstance(s, int)]; dup = len(set(ints)) != len(ints)
+        return "WRITER_RACE" if (dup or race_signal) else "DELETION_EDIT"
+    if anchor_seq is None: return "NO_ANCHOR"
+    if last_seq < anchor_seq: return "TAIL_TRUNCATION"
+    if last_seq == anchor_seq and anchor_head and not hmac.compare_digest(last_head, anchor_head): return "TAIL_REWRITTEN"
+    if last_seq > anchor_seq: return "MORE_RECORDS"
+    return "NO_ANOMALY"
